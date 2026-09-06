@@ -4,6 +4,15 @@ Two standalone Python CLI tools for creative video processing — both preserve 
 
 ---
 
+## What it does
+
+| Step 1 — Original footage | Step 2 — Strips extracted | Step 3 — Kaleidoscope |
+|:---:|:---:|:---:|
+| ![Original arm footage](images/bands-orig.png) | ![Segmented LED strips](images/bands-segmented.png) | ![Kaleidoscope output](images/bands-final.png) |
+| Raw video of an arm wearing 7 LumiBand LED strips, filmed on a tripod. The strips are spread across the frame with background visible between them. | `led_pack.py` estimates the background via temporal median, uses SAM2 to lasso each strip with a pixel-precise mask, and packs the 7 cutouts side-by-side with a black gap. | `kaleidoscope.py` folds the packed strip video into a mirrored radial pattern — here with 12 segments, producing the symmetric LED mandala effect. |
+
+---
+
 ## kaleidoscope.py
 
 Applies a mirrored radial kaleidoscope effect to video clips.  For each output pixel it computes the angle and radius from a center point, folds the angle into `360°/segments` mirror-symmetric wedges, and samples the source frame at the reflected position.  All parameters can be animated over the clip.
