@@ -25,6 +25,8 @@ from led_pack import (
     _pick_hevc_encoder,
     estimate_background,
     detect_strips_blobs,
+    detect_strips_blobs_with_fallback,
+    blob_backend_name,
 )
 
 
@@ -141,6 +143,7 @@ def process_video(in_path, out_path, n_strips=7, gap=8, out_height=None,
     seek_pre = ['-ss', f'{t_start:.6f}'] if t_start > 0 else []
     dur_arg  = ['-t',  f'{t_duration:.6f}']
 
+    print(f"  Blob backend: {blob_backend_name()}")
     print("  Estimating background (temporal median, full clip)...")
     background_u8 = estimate_background(in_path, width, height, n_frames_total)
 
@@ -157,10 +160,14 @@ def process_video(in_path, out_path, n_strips=7, gap=8, out_height=None,
     r0.stdout.close(); r0.wait()
     f0 = np.frombuffer(raw0, dtype=np.uint16).reshape(height, width, 3).copy()
 
-    boxes, masks, blob_curves, blob_half_w = detect_strips_blobs(
+    boxes, masks, blob_curves, blob_half_w = detect_strips_blobs_with_fallback(
         f0, background_u8, None, n_strips)
     if boxes is None:
-        raise RuntimeError(f"Could not detect {n_strips} strips in frame 0.")
+        raise RuntimeError(
+            f"Could not detect {n_strips} strips in frame 0.  "
+            "Try lowering --half-width, adjusting --n-strips, or set "
+            "KALEIDO_BLOB_BACKEND=scipy for stricter detection."
+        )
 
     extract_half_w = half_width if half_width else max(10, blob_half_w // 2)
     strip_width = int(extract_half_w * 2)
@@ -206,9 +213,16 @@ def process_video(in_path, out_path, n_strips=7, gap=8, out_height=None,
     ] + enc_extra + ['-v', 'error', silent_path]
     writer = subprocess.Popen(encode_cmd, stdin=subprocess.PIPE)
 
-    _DONE    = object()
-    decode_q = Queue(maxsize=4)
-    encode_q = Queue(maxsize=4)
+    # 4-stage pipeline: decode → detect → extract → encode.  Each stage runs
+    # in its own thread so ffmpeg (decode/encode) and Python (detect/extract)
+    # all make progress at the same time.  numpy/torch release the GIL for
+    # most ops, so the Python threads do run in parallel on separate cores.
+    _DONE     = object()
+    decode_q  = Queue(maxsize=4)
+    detect_q  = Queue(maxsize=4)
+    encode_q  = Queue(maxsize=4)
+    counters  = {'n_fallback': 0, 'frame_idx': 0}
+    basename  = os.path.basename(in_path)
 
     def _bg_decode():
         while True:
@@ -217,42 +231,33 @@ def process_video(in_path, out_path, n_strips=7, gap=8, out_height=None,
                 decode_q.put(_DONE); return
             decode_q.put(np.frombuffer(raw, dtype=np.uint16).reshape(height, width, 3).copy())
 
-    def _bg_encode():
-        while True:
-            item = encode_q.get()
-            if item is _DONE: return
-            writer.stdin.write(item.tobytes())
-
-    decode_thread = Thread(target=_bg_decode, daemon=True)
-    encode_thread = Thread(target=_bg_encode, daemon=True)
-    decode_thread.start()
-    encode_thread.start()
-
-    frame_idx  = 0
-    n_fallback = 0
-    basename   = os.path.basename(in_path)
-
-    try:
+    def _bg_detect():
+        curves = blob_curves
         while True:
             item = decode_q.get()
             if item is _DONE:
-                break
+                detect_q.put(_DONE); return
             frame = item
-
             _, _, new_curves, _ = detect_strips_blobs(
-                frame, background_u8, blob_curves, n_strips, half_w=blob_half_w)
+                frame, background_u8, curves, n_strips, half_w=blob_half_w)
             if new_curves is None:
-                n_fallback += 1
+                counters['n_fallback'] += 1
             else:
-                blob_curves = new_curves
+                curves = new_curves
+            detect_q.put((frame, curves))
 
+    def _bg_extract():
+        while True:
+            item = detect_q.get()
+            if item is _DONE:
+                encode_q.put(_DONE); return
+            frame, curves = item
             strips = []
             for s in range(n_strips):
-                straight = _straighten(frame, blob_curves[s], strip_width)
+                straight = _straighten(frame, curves[s], strip_width)
                 strips.append(_squeeze_rows(straight, out_height, threshold_frac))
             if blend_width > 0:
                 canvas = _pack_with_blend(strips, blend_width)
-                # _pack_with_blend rounds to even; pad or crop to expected out_width
                 if canvas.shape[1] != out_width:
                     pad_w = out_width - canvas.shape[1]
                     if pad_w > 0:
@@ -267,19 +272,35 @@ def process_video(in_path, out_path, n_strips=7, gap=8, out_height=None,
                     x_cursor += strip_width + gap
             encode_q.put(canvas)
 
-            frame_idx += 1
-            if frame_idx % 60 == 0:
-                pct = f" ({int(frame_idx / n_frames * 100)}%)" if n_frames > 0 else ""
-                print(f"  {basename}: {frame_idx}/{n_frames} frames{pct}")
+            counters['frame_idx'] += 1
+            i = counters['frame_idx']
+            if i % 60 == 0:
+                pct = f" ({int(i / n_frames * 100)}%)" if n_frames > 0 else ""
+                print(f"  {basename}: {i}/{n_frames} frames{pct}")
+
+    def _bg_encode():
+        while True:
+            item = encode_q.get()
+            if item is _DONE: return
+            writer.stdin.write(item.tobytes())
+
+    threads = [
+        Thread(target=_bg_decode,  daemon=True),
+        Thread(target=_bg_detect,  daemon=True),
+        Thread(target=_bg_extract, daemon=True),
+        Thread(target=_bg_encode,  daemon=True),
+    ]
+    for t in threads: t.start()
+    try:
+        threads[-1].join()   # wait for encoder to drain
     finally:
-        encode_q.put(_DONE)
-        encode_thread.join()
+        for t in threads[:-1]: t.join(timeout=1)
         reader.stdout.close()
         reader.wait()
         writer.stdin.close()
         writer.wait()
-        decode_thread.join()
 
+    n_fallback = counters['n_fallback']
     if n_fallback:
         print(f"  ({n_fallback} frames reused the previous curves)")
 

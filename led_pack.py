@@ -450,9 +450,98 @@ def _find_initial_boxes_diff(in_path, width, height, threshold, n_strips):
 
 
 # ── LED blob detection (per-frame, no SAM2) ───────────────────────────────────
+#
+# The Gaussian + max-filter combo used to find LED positions is the single
+# most expensive step in the per-frame loop.  We pick the fastest backend
+# available at import time (once) and cache it:
+#   1. torch on MPS or CUDA — massively parallel, uses the GPU
+#   2. cv2  (GaussianBlur + dilate) — SIMD/multi-threaded CPU
+#   3. scipy.ndimage — single-threaded fallback
 
-def _led_blobs(fg_gray, min_distance=8, threshold=45, sigma=1.5):
-    """Local maxima in the foreground → (N, 2) int32 array of (y, x) blob coords."""
+_BLOB_BACKEND = None
+_BLOB_DEVICE  = None
+
+def _init_blob_backend():
+    global _BLOB_BACKEND, _BLOB_DEVICE
+    if _BLOB_BACKEND is not None:
+        return
+    # Manual override for testing or MPS-quirk workarounds.
+    forced = os.environ.get('KALEIDO_BLOB_BACKEND', '').strip().lower()
+    if forced in ('torch', 'cv2', 'scipy'):
+        _BLOB_BACKEND = forced
+        if forced == 'torch':
+            try:
+                import torch
+                if torch.backends.mps.is_available():
+                    _BLOB_DEVICE = torch.device('mps')
+                elif torch.cuda.is_available():
+                    _BLOB_DEVICE = torch.device('cuda')
+                else:
+                    _BLOB_DEVICE = torch.device('cpu')
+            except ImportError:
+                _BLOB_BACKEND = 'scipy'
+        return
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            _BLOB_BACKEND, _BLOB_DEVICE = 'torch', torch.device('mps')
+            return
+        if torch.cuda.is_available():
+            _BLOB_BACKEND, _BLOB_DEVICE = 'torch', torch.device('cuda')
+            return
+    except ImportError:
+        pass
+    try:
+        import cv2  # noqa: F401
+        _BLOB_BACKEND = 'cv2'
+        return
+    except ImportError:
+        pass
+    _BLOB_BACKEND = 'scipy'
+
+
+def _led_blobs_torch(fg_gray, min_distance, threshold, sigma):
+    import torch
+    import torch.nn.functional as F
+    # Convert to float32 on host first — MPS was historically fussy about
+    # dtype casts done on the device side.
+    x = torch.from_numpy(fg_gray.astype(np.float32)).to(_BLOB_DEVICE).unsqueeze(0).unsqueeze(0)
+    # Separable Gaussian (two 1-D passes) — much cheaper than one 2-D pass.
+    k = max(3, int(2 * 3 * sigma + 1) | 1)   # odd kernel size
+    coords = torch.arange(k, device=_BLOB_DEVICE, dtype=torch.float32) - (k - 1) / 2
+    g = torch.exp(-coords ** 2 / (2 * sigma * sigma))
+    g = g / g.sum()
+    gy = g.view(1, 1, k, 1)
+    gx = g.view(1, 1, 1, k)
+    smoothed = F.conv2d(x,        gy, padding=(k // 2, 0))
+    smoothed = F.conv2d(smoothed, gx, padding=(0, k // 2))
+    # Max filter with stride=1.  `padding` on max_pool2d uses -inf so edges
+    # don't spawn spurious peaks.
+    ms = min_distance * 2 + 1
+    max_filt = F.max_pool2d(smoothed, kernel_size=ms, stride=1, padding=ms // 2)
+    is_peak = (smoothed == max_filt) & (smoothed > threshold)
+    # Do the where on the CPU — torch.nonzero on MPS has been buggy in
+    # some torch releases.
+    is_peak_np = is_peak.squeeze(0).squeeze(0).to('cpu').numpy()
+    ys, xs = np.where(is_peak_np)
+    if ys.size == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    return np.stack([ys, xs], axis=1).astype(np.int32)
+
+
+def _led_blobs_cv2(fg_gray, min_distance, threshold, sigma):
+    import cv2
+    smoothed = cv2.GaussianBlur(fg_gray, (0, 0), sigma)
+    ms = min_distance * 2 + 1
+    max_filt = cv2.dilate(smoothed, np.ones((ms, ms), np.uint8))
+    is_peak = (smoothed == max_filt) & (smoothed > threshold)
+    ys, xs = np.where(is_peak)
+    if ys.size == 0:
+        return np.zeros((0, 2), dtype=np.int32)
+    return np.stack([ys, xs], axis=1).astype(np.int32)
+
+
+def _led_blobs_scipy(fg_gray, min_distance, threshold, sigma):
     from scipy.ndimage import maximum_filter, gaussian_filter
     smoothed = gaussian_filter(fg_gray, sigma=sigma)
     max_filt = maximum_filter(smoothed, size=min_distance * 2 + 1)
@@ -461,6 +550,61 @@ def _led_blobs(fg_gray, min_distance=8, threshold=45, sigma=1.5):
     if ys.size == 0:
         return np.zeros((0, 2), dtype=np.int32)
     return np.stack([ys, xs], axis=1).astype(np.int32)
+
+
+def _led_blobs(fg_gray, min_distance=8, threshold=45, sigma=1.5):
+    """Local maxima in the foreground → (N, 2) int32 array of (y, x) blob coords.
+
+    Dispatches to the fastest available backend detected at first call.
+    """
+    if _BLOB_BACKEND is None:
+        _init_blob_backend()
+    if _BLOB_BACKEND == 'torch':
+        return _led_blobs_torch(fg_gray, min_distance, threshold, sigma)
+    if _BLOB_BACKEND == 'cv2':
+        return _led_blobs_cv2(fg_gray, min_distance, threshold, sigma)
+    return _led_blobs_scipy(fg_gray, min_distance, threshold, sigma)
+
+
+def blob_backend_name():
+    """Human-readable name of the active blob-detection backend."""
+    if _BLOB_BACKEND is None:
+        _init_blob_backend()
+    if _BLOB_BACKEND == 'torch':
+        return f"torch/{_BLOB_DEVICE.type.upper()}"
+    return _BLOB_BACKEND
+
+
+def detect_strips_blobs_with_fallback(frame_u16, background_u8, prev_curves,
+                                       n_strips, half_w=None):
+    """Detect strips with the primary backend; if that returns None (or too few
+    blobs to bootstrap), retry once using scipy as a safety net.  Prints a
+    short diagnostic if a fallback is needed."""
+    global _BLOB_BACKEND
+    boxes, masks, curves, hw = detect_strips_blobs(
+        frame_u16, background_u8, prev_curves, n_strips, half_w=half_w)
+    if boxes is not None:
+        return boxes, masks, curves, hw
+
+    fg = _fg_for_sam2(frame_u16, background_u8)
+    n_primary = _led_blobs(fg.max(axis=2)).shape[0]
+    primary = blob_backend_name()
+    if primary != 'scipy':
+        saved = _BLOB_BACKEND
+        _BLOB_BACKEND = 'scipy'
+        try:
+            n_scipy = _led_blobs(fg.max(axis=2)).shape[0]
+            print(f"  Primary backend ({primary}) found {n_primary} blobs; "
+                  f"scipy fallback found {n_scipy} — retrying with scipy.")
+            boxes, masks, curves, hw = detect_strips_blobs(
+                frame_u16, background_u8, prev_curves, n_strips, half_w=half_w)
+            if boxes is not None:
+                return boxes, masks, curves, hw
+        finally:
+            _BLOB_BACKEND = saved
+    else:
+        print(f"  Detection failed on frame 0 — scipy backend found only {n_primary} blobs.")
+    return None, None, prev_curves, hw
 
 
 def _bootstrap_peak_xs(fg_gray, blobs, n_strips, min_support=5):
@@ -753,7 +897,7 @@ def process_video(in_path, out_path, gap=8, threshold=1000, lock_boxes=False,
     blob_curves = None
     blob_half_w = None
     if blob_detect:
-        print("  Blob detection mode — per-frame LED tracking (no SAM2)...")
+        print(f"  Blob detection mode — per-frame LED tracking (backend: {blob_backend_name()})")
         r0 = subprocess.Popen(
             ['ffmpeg'] + seek_pre + ['-i', in_path, '-vframes', '1',
              '-f', 'rawvideo', '-pix_fmt', 'rgb48le', '-v', 'error', 'pipe:1'],
